@@ -1,4 +1,4 @@
-package dev.sshaplygin.vpn_detector
+package dev.sshaplygin.device_inspector
 
 import io.flutter.embedding.android.FlutterActivity
 

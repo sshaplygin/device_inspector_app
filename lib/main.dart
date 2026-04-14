@@ -1,12 +1,46 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:rxdart/rxdart.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:safe_device/safe_device.dart';
+import 'package:safe_device/safe_device_config.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:geolocator/geolocator.dart';
 
-void main() => runApp(const DeviceInspectorApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  SafeDevice.init(
+    SafeDeviceConfig(mockLocationCheckEnabled: true),
+  );
+
+  runApp(const DeviceInspectorApp());
+}
+
+class DeviceSnapshot {
+  final String name;
+  final String osVersion;
+  final List<String> interfaces;
+  final bool isVpnActive;
+  final bool isJailBroken;
+  final bool isRealDevice;
+  final bool isMockLocation;
+  final bool isDevMode;
+
+  DeviceSnapshot({
+    required this.name,
+    required this.osVersion,
+    required this.interfaces,
+    required this.isVpnActive,
+    required this.isJailBroken,
+    required this.isRealDevice,
+    required this.isMockLocation,
+    required this.isDevMode,
+  });
+}
 
 class DeviceInspectorApp extends StatelessWidget {
   const DeviceInspectorApp({super.key});
@@ -35,84 +69,132 @@ class InspectorScreen extends StatefulWidget {
 }
 
 class _InspectorScreenState extends State<InspectorScreen> {
-  // Общие данные
   String _deviceName = "Loading...";
   String _osVersion = "";
   List<String> _interfaces = [];
 
-  // Флаги безопасности
   bool _isVpnActive = false;
   bool _isJailBroken = false;
   bool _isRealDevice = true;
+  bool _isMockLocation = false;
   bool _isDevMode = false;
   bool _onExternalStorage = false;
 
-  late StreamSubscription _sub;
+  late StreamSubscription _mainSub;
+  bool _isChecking = false;
 
-  @override
+   @override
   void initState() {
     super.initState();
+
+    final networkTrigger = Connectivity().onConnectivityChanged;
+    final timerTrigger = Stream.periodic(const Duration(seconds: 3));
+
+    _mainSub = MergeStream([
+      networkTrigger,
+      timerTrigger,
+    ])
+    .debounceTime(const Duration(milliseconds: 500))
+    .listen((_) => _checkAll());
+
     _checkAll();
-    _sub = Connectivity().onConnectivityChanged.listen((_) => _checkAll());
   }
 
   Future<void> _checkAll() async {
-    // 1. Проверка VPN (API + Интерфейсы)
-    bool vpn = false;
-    List<String> ifaces = [];
-    final res = await Connectivity().checkConnectivity();
-    if (res.contains(ConnectivityResult.vpn)) vpn = true;
+    if (_isChecking) return;
+    _isChecking = true;
 
     try {
-      final networkInterfaces = await NetworkInterface.list();
-      for (var i in networkInterfaces) {
-        ifaces.add(i.name);
-        if (RegExp(r'tun|ppp|tap|utun|ipsec').hasMatch(i.name.toLowerCase())) {
-          vpn = true;
+      if (Platform.isAndroid) {
+        if (await Permission.location.isDenied) {
+          await Permission.location.request();
         }
       }
-    } catch (_) {}
 
-    // 2. Параметры SafeDevice (нативно для обеих ОС)
-    bool jailbroken = await SafeDevice.isJailBroken;
-    bool realDevice = await SafeDevice.isRealDevice;
-    bool devMode = await SafeDevice.isDevelopmentModeEnable;
-    bool external = await SafeDevice.isOnExternalStorage;
+      final results = await Future.wait([
+        _getNetworkData(),
+        _getSecurityData(),
+        _getDeviceHardwareInfo(),
+      ]);
 
-    // 3. Device Info
-    DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
-    String name = "";
-    String version = "";
+      if (!mounted) return;
 
-    if (Platform.isIOS) {
-      IosDeviceInfo iosInfo = await deviceInfo.iosInfo;
-      name = iosInfo.name; // Имя, заданное пользователем (напр. "Sam's iPhone")
-      version = "${iosInfo.systemName} ${iosInfo.systemVersion}";
-    } else {
-      AndroidDeviceInfo androidInfo = await deviceInfo.androidInfo;
-      name = "${androidInfo.brand} ${androidInfo.model}";
-      version = "Android ${androidInfo.version.release} (API ${androidInfo.version.sdkInt})";
+      final network = results[0] as Map<String, dynamic>;
+      final security = results[1] as Map<String, dynamic>;
+      final device = results[2] as Map<String, String>;
+
+      setState(() {
+        _deviceName = device['name']!;
+        _osVersion = device['version']!;
+        _interfaces = network['interfaces'];
+        _isVpnActive = network['vpn'];
+        _isJailBroken = security['jailbroken'];
+        _isRealDevice = security['realDevice'];
+        _isMockLocation = security['mockLocation'];
+        _isDevMode = security['devMode'];
+      });
+    } catch (e) {
+      debugPrint("Check error: $e");
+    } finally {
+      _isChecking = false;
     }
-
-    setState(() {
-      _isVpnActive = vpn;
-      _interfaces = ifaces;
-      _isJailBroken = jailbroken;
-      _isRealDevice = realDevice;
-      _isDevMode = devMode;
-      _onExternalStorage = external;
-      _deviceName = name;
-      _osVersion = version;
-    });
   }
 
   @override
   void dispose() {
-    _sub.cancel();
+    _mainSub.cancel();
     super.dispose();
   }
 
-  // Вспомогательный метод для отображения строк данных
+  Future<Map<String, dynamic>> _getNetworkData() async {
+    bool vpn = false;
+    final connectivity = await Connectivity().checkConnectivity();
+    if (connectivity.contains(ConnectivityResult.vpn)) vpn = true;
+
+    final interfaces = await NetworkInterface.list();
+    final ifaceNames = interfaces.map((i) => i.name).toList();
+
+    if (ifaceNames.any((name) => RegExp(r'tun|ppp|tap|utun|ipsec').hasMatch(name.toLowerCase()))) {
+      vpn = true;
+    }
+
+    return {'vpn': vpn, 'interfaces': ifaceNames};
+  }
+
+  Future<Map<String, dynamic>> _getSecurityData() async {
+    bool mockDetected = false;
+    try {
+      Position? pos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+        timeLimit: const Duration(seconds: 3),
+      ).timeout(const Duration(seconds: 4));
+      mockDetected = pos.isMocked;
+    } catch (_) {
+      mockDetected = await SafeDevice.isMockLocation;
+    }
+
+    return {
+      'jailbroken': await SafeDevice.isJailBroken,
+      'realDevice': await SafeDevice.isRealDevice,
+      'mockLocation': mockDetected,
+      'devMode': await SafeDevice.isDevelopmentModeEnable,
+    };
+  }
+
+  Future<Map<String, String>> _getDeviceHardwareInfo() async {
+    DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
+    if (Platform.isIOS) {
+      IosDeviceInfo ios = await deviceInfo.iosInfo;
+      return {'name': ios.name, 'version': "${ios.systemName} ${ios.systemVersion}"};
+    }
+
+    AndroidDeviceInfo android = await deviceInfo.androidInfo;
+    return {
+      'name': "${android.brand} ${android.model}",
+      'version': "Android ${android.version.release} (API ${android.version.sdkInt})"
+    };
+  }
+
   Widget _buildInfoRow(String label, String value, {bool? status}) {
     Color? textColor;
     if (status != null) {
@@ -184,6 +266,7 @@ class _InspectorScreenState extends State<InspectorScreen> {
         status: !_isJailBroken
       ),
       _buildInfoRow("Real Device", _isRealDevice ? "YES" : "EMULATOR", status: _isRealDevice),
+      _buildInfoRow("Real Location", _isMockLocation ? "MOCK" : "REAL", status: !_isMockLocation),
       _buildInfoRow("Dev Mode / ADB", _isDevMode ? "ON" : "OFF", status: !_isDevMode),
 
       _sectionHeader("NETWORK INTERFACES"),

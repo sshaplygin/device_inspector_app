@@ -1,4 +1,4 @@
-# vpn_detector
+# device_inspector
 
 A new Flutter project.
 
