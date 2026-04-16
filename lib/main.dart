@@ -259,7 +259,7 @@ class _InspectorScreenState extends State<InspectorScreen> {
       ),
       const SizedBox(height: 20),
       _sectionHeader("SYSTEM SECURITY"),
-      _buildInfoRow("VPN Active", _isVpnActive ? "YES" : "NO", status: _isVpnActive),
+      _buildInfoRow("VPN Active", _isVpnActive ? "YES" : "NO", status: !_isVpnActive),
       _buildInfoRow(
         Platform.isIOS ? "Jailbreak" : "Root Access",
         _isJailBroken ? "YES" : "NO",
