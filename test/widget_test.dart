@@ -1,30 +1,26 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
-
-import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:device_inspector/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('renders the inspector screen and surfaces check failures',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const DeviceInspectorApp());
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+    expect(find.text('DeviceInspector'), findsOneWidget);
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+    // Platform plugins never answer under flutter_test, so the initial check
+    // runs into the app's own timeouts (3s permission + 10s data fetch) and
+    // must land on the error state instead of hanging on the spinner.
+    final errorText = find.text("Couldn't read device state");
+    for (var i = 0; i < 14 && !tester.any(errorText); i++) {
+      await tester.pump(const Duration(seconds: 1));
+    }
+    expect(errorText, findsOneWidget);
+    expect(find.text('Retry'), findsOneWidget);
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    // Dispose the screen so the periodic re-check timer is cancelled.
+    await tester.pumpWidget(const SizedBox());
   });
 }

@@ -1,5 +1,5 @@
 name: device_inspector
-description: "A new Flutter project."
+description: "DeviceInspector — shows device trust signals: VPN activity, jailbreak/root, emulator, mock location, and developer mode."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: "none" # Remove this line if you wish to publish to pub.dev
@@ -37,7 +37,6 @@ dependencies:
   connectivity_plus: ^7.1.1
   device_info_plus: ^12.4.0
   safe_device: ^1.3.8
-  permission_handler: ^12.0.1
   geolocator: ^14.0.2
   rxdart: ^0.28.0
 

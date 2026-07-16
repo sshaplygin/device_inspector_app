@@ -1,16 +1,16 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:rxdart/rxdart.dart';
+
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
-import 'package:device_info_plus/device_info_plus.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:rxdart/rxdart.dart';
 import 'package:safe_device/safe_device.dart';
 import 'package:safe_device/safe_device_config.dart';
-import 'package:permission_handler/permission_handler.dart';
-import 'package:geolocator/geolocator.dart';
 
-void main() async {
+void main() {
   WidgetsFlutterBinding.ensureInitialized();
 
   SafeDevice.init(
@@ -68,36 +68,68 @@ class InspectorScreen extends StatefulWidget {
   State<InspectorScreen> createState() => _InspectorScreenState();
 }
 
-class _InspectorScreenState extends State<InspectorScreen> {
-  String _deviceName = "Loading...";
-  String _osVersion = "";
-  List<String> _interfaces = [];
+class _InspectorScreenState extends State<InspectorScreen>
+    with WidgetsBindingObserver {
+  static final _vpnInterfacePattern = RegExp(r'^(utun|tun|tap|ppp|ipsec)');
 
-  bool _isVpnActive = false;
-  bool _isJailBroken = false;
-  bool _isRealDevice = true;
-  bool _isMockLocation = false;
-  bool _isDevMode = false;
-  bool _onExternalStorage = false;
+  DeviceSnapshot? _snapshot;
+  bool _failed = false;
 
-  late StreamSubscription _mainSub;
+  StreamSubscription<Object?>? _triggerSub;
   bool _isChecking = false;
 
-   @override
+  @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     final networkTrigger = Connectivity().onConnectivityChanged;
-    final timerTrigger = Stream.periodic(const Duration(seconds: 3));
+    final timerTrigger = Stream<Object?>.periodic(const Duration(seconds: 15));
 
-    _mainSub = MergeStream([
-      networkTrigger,
-      timerTrigger,
-    ])
-    .debounceTime(const Duration(milliseconds: 500))
-    .listen((_) => _checkAll());
+    _triggerSub = MergeStream<Object?>([networkTrigger, timerTrigger])
+        .debounceTime(const Duration(milliseconds: 500))
+        .listen(
+          (_) => _checkAll(),
+          onError: (Object e) => debugPrint("Trigger stream error: $e"),
+        );
 
-    _checkAll();
+    _start();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _triggerSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final sub = _triggerSub;
+    if (sub == null) return;
+    if (state == AppLifecycleState.resumed) {
+      if (sub.isPaused) sub.resume();
+      _checkAll();
+    } else if (!sub.isPaused) {
+      sub.pause();
+    }
+  }
+
+  Future<void> _start() async {
+    await _ensureLocationPermission();
+    await _checkAll();
+  }
+
+  Future<void> _ensureLocationPermission() async {
+    try {
+      final permission = await Geolocator.checkPermission()
+          .timeout(const Duration(seconds: 3));
+      if (permission == LocationPermission.denied) {
+        await Geolocator.requestPermission();
+      }
+    } catch (e) {
+      debugPrint("Permission check failed: $e");
+    }
   }
 
   Future<void> _checkAll() async {
@@ -105,94 +137,114 @@ class _InspectorScreenState extends State<InspectorScreen> {
     _isChecking = true;
 
     try {
-      if (Platform.isAndroid) {
-        if (await Permission.location.isDenied) {
-          await Permission.location.request();
-        }
-      }
-
-      final results = await Future.wait([
+      // The timeout guards against a plugin call that never answers, which
+      // would otherwise pin the UI on the spinner forever.
+      final (network, security, device) = await (
         _getNetworkData(),
         _getSecurityData(),
         _getDeviceHardwareInfo(),
-      ]);
+      ).wait.timeout(const Duration(seconds: 10));
 
       if (!mounted) return;
-
-      final network = results[0] as Map<String, dynamic>;
-      final security = results[1] as Map<String, dynamic>;
-      final device = results[2] as Map<String, String>;
-
       setState(() {
-        _deviceName = device['name']!;
-        _osVersion = device['version']!;
-        _interfaces = network['interfaces'];
-        _isVpnActive = network['vpn'];
-        _isJailBroken = security['jailbroken'];
-        _isRealDevice = security['realDevice'];
-        _isMockLocation = security['mockLocation'];
-        _isDevMode = security['devMode'];
+        _failed = false;
+        _snapshot = DeviceSnapshot(
+          name: device.name,
+          osVersion: device.version,
+          interfaces: network.interfaces,
+          isVpnActive: network.vpn,
+          isJailBroken: security.jailbroken,
+          isRealDevice: security.realDevice,
+          isMockLocation: security.mockLocation,
+          isDevMode: security.devMode,
+        );
       });
     } catch (e) {
       debugPrint("Check error: $e");
+      if (mounted && _snapshot == null) {
+        setState(() => _failed = true);
+      }
     } finally {
       _isChecking = false;
     }
   }
 
-  @override
-  void dispose() {
-    _mainSub.cancel();
-    super.dispose();
-  }
-
-  Future<Map<String, dynamic>> _getNetworkData() async {
-    bool vpn = false;
+  Future<({bool vpn, List<String> interfaces})> _getNetworkData() async {
     final connectivity = await Connectivity().checkConnectivity();
-    if (connectivity.contains(ConnectivityResult.vpn)) vpn = true;
+    bool vpn = connectivity.contains(ConnectivityResult.vpn);
 
     final interfaces = await NetworkInterface.list();
-    final ifaceNames = interfaces.map((i) => i.name).toList();
+    final names = interfaces.map((i) => i.name).toList();
 
-    if (ifaceNames.any((name) => RegExp(r'tun|ppp|tap|utun|ipsec').hasMatch(name.toLowerCase()))) {
-      vpn = true;
+    if (!vpn) {
+      if (Platform.isAndroid) {
+        // On Android a tun/ppp interface only exists while a VPN is up.
+        vpn = names.any((n) => _vpnInterfacePattern.hasMatch(n.toLowerCase()));
+      } else if (Platform.isIOS) {
+        // iOS keeps system utun interfaces up even without a VPN, so the
+        // name alone is meaningless; only count tunnels that carry a
+        // routable address.
+        vpn = interfaces.any((i) =>
+            _vpnInterfacePattern.hasMatch(i.name.toLowerCase()) &&
+            i.addresses.any(_isRoutable));
+      }
     }
 
-    return {'vpn': vpn, 'interfaces': ifaceNames};
+    return (vpn: vpn, interfaces: names);
   }
 
-  Future<Map<String, dynamic>> _getSecurityData() async {
-    bool mockDetected = false;
+  static bool _isRoutable(InternetAddress address) {
+    if (address.type == InternetAddressType.IPv4) return true;
+    // Link-local (fe80::/10) and unique-local (fc00::/7) IPv6 addresses are
+    // assigned to system tunnels; a VPN gets a globally routable one.
+    final ip = address.address.toLowerCase();
+    return !address.isLinkLocal && !ip.startsWith('fc') && !ip.startsWith('fd');
+  }
+
+  Future<({bool jailbroken, bool realDevice, bool mockLocation, bool devMode})>
+      _getSecurityData() async {
+    return (
+      jailbroken: await SafeDevice.isJailBroken,
+      realDevice: await SafeDevice.isRealDevice,
+      mockLocation: await _isLocationMocked(),
+      devMode: await SafeDevice.isDevelopmentModeEnable,
+    );
+  }
+
+  Future<bool> _isLocationMocked() async {
     try {
-      Position? pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-        timeLimit: const Duration(seconds: 3),
-      ).timeout(const Duration(seconds: 4));
-      mockDetected = pos.isMocked;
-    } catch (_) {
-      mockDetected = await SafeDevice.isMockLocation;
+      final permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.whileInUse ||
+          permission == LocationPermission.always) {
+        final position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.low,
+            timeLimit: Duration(seconds: 3),
+          ),
+        ).timeout(const Duration(seconds: 4));
+        return position.isMocked;
+      }
+    } catch (e) {
+      debugPrint("Location check failed: $e");
     }
-
-    return {
-      'jailbroken': await SafeDevice.isJailBroken,
-      'realDevice': await SafeDevice.isRealDevice,
-      'mockLocation': mockDetected,
-      'devMode': await SafeDevice.isDevelopmentModeEnable,
-    };
+    return SafeDevice.isMockLocation;
   }
 
-  Future<Map<String, String>> _getDeviceHardwareInfo() async {
-    DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
+  Future<({String name, String version})> _getDeviceHardwareInfo() async {
+    final deviceInfo = DeviceInfoPlugin();
     if (Platform.isIOS) {
-      IosDeviceInfo ios = await deviceInfo.iosInfo;
-      return {'name': ios.name, 'version': "${ios.systemName} ${ios.systemVersion}"};
+      final ios = await deviceInfo.iosInfo;
+      return (
+        name: ios.name,
+        version: "${ios.systemName} ${ios.systemVersion}",
+      );
     }
 
-    AndroidDeviceInfo android = await deviceInfo.androidInfo;
-    return {
-      'name': "${android.brand} ${android.model}",
-      'version': "Android ${android.version.release} (API ${android.version.sdkInt})"
-    };
+    final android = await deviceInfo.androidInfo;
+    return (
+      name: "${android.brand} ${android.model}",
+      version: "Android ${android.version.release} (API ${android.version.sdkInt})",
+    );
   }
 
   Widget _buildInfoRow(String label, String value, {bool? status}) {
@@ -222,25 +274,47 @@ class _InspectorScreenState extends State<InspectorScreen> {
   Widget _buildIos() {
     return CupertinoPageScaffold(
       backgroundColor: CupertinoColors.systemGroupedBackground,
-      navigationBar: const CupertinoNavigationBar(middle: Text("Device Inspector")),
-      child: SafeArea(
-        child: ListView(
-          children: _buildContent(),
-        ),
-      ),
+      navigationBar: const CupertinoNavigationBar(middle: Text("DeviceInspector")),
+      child: SafeArea(child: _buildBody()),
     );
   }
 
   Widget _buildAndroid() {
     return Scaffold(
-      appBar: AppBar(title: const Text("Device Inspector"), backgroundColor: Colors.blue.withOpacity(0.1)),
-      body: ListView(
-        children: _buildContent(),
+      appBar: AppBar(
+        title: const Text("DeviceInspector"),
+        backgroundColor: Colors.blue.withValues(alpha: 0.1),
       ),
+      body: _buildBody(),
     );
   }
 
-  List<Widget> _buildContent() {
+  Widget _buildBody() {
+    final snapshot = _snapshot;
+    if (snapshot == null) {
+      return Center(child: _failed ? _buildError() : _buildSpinner());
+    }
+    return ListView(children: _buildContent(snapshot));
+  }
+
+  Widget _buildSpinner() {
+    return Platform.isIOS
+        ? const CupertinoActivityIndicator()
+        : const CircularProgressIndicator();
+  }
+
+  Widget _buildError() {
+    const message = Text("Couldn't read device state");
+    final retry = Platform.isIOS
+        ? CupertinoButton(onPressed: _checkAll, child: const Text("Retry"))
+        : TextButton(onPressed: _checkAll, child: const Text("Retry"));
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [message, retry],
+    );
+  }
+
+  List<Widget> _buildContent(DeviceSnapshot snapshot) {
     return [
       const SizedBox(height: 20),
       Center(
@@ -252,35 +326,55 @@ class _InspectorScreenState extends State<InspectorScreen> {
               color: Colors.grey,
             ),
             const SizedBox(height: 10),
-            Text(_deviceName, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-            Text(_osVersion, style: const TextStyle(color: Colors.grey)),
+            Text(snapshot.name, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            Text(snapshot.osVersion, style: const TextStyle(color: Colors.grey)),
           ],
         ),
       ),
       const SizedBox(height: 20),
       _sectionHeader("SYSTEM SECURITY"),
-      _buildInfoRow("VPN Active", _isVpnActive ? "YES" : "NO", status: !_isVpnActive),
+      _buildInfoRow("VPN Active", snapshot.isVpnActive ? "YES" : "NO", status: !snapshot.isVpnActive),
       _buildInfoRow(
         Platform.isIOS ? "Jailbreak" : "Root Access",
-        _isJailBroken ? "YES" : "NO",
-        status: !_isJailBroken
+        snapshot.isJailBroken ? "YES" : "NO",
+        status: !snapshot.isJailBroken,
       ),
-      _buildInfoRow("Real Device", _isRealDevice ? "YES" : "EMULATOR", status: _isRealDevice),
-      _buildInfoRow("Real Location", _isMockLocation ? "MOCK" : "REAL", status: !_isMockLocation),
-      _buildInfoRow("Dev Mode / ADB", _isDevMode ? "ON" : "OFF", status: !_isDevMode),
+      _buildInfoRow("Real Device", snapshot.isRealDevice ? "YES" : "EMULATOR", status: snapshot.isRealDevice),
+      _buildInfoRow("Real Location", snapshot.isMockLocation ? "MOCK" : "REAL", status: !snapshot.isMockLocation),
+      _buildInfoRow("Dev Mode / ADB", snapshot.isDevMode ? "ON" : "OFF", status: !snapshot.isDevMode),
 
       _sectionHeader("NETWORK INTERFACES"),
       Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         child: Wrap(
           spacing: 8,
-          children: _interfaces.map((i) => Chip(
-            label: Text(i, style: const TextStyle(fontSize: 12)),
-            backgroundColor: (i.contains('tun') || i.contains('ppp')) ? Colors.blue.withOpacity(0.2) : null,
-          )).toList(),
+          runSpacing: 8,
+          children: snapshot.interfaces.map(_buildInterfaceChip).toList(),
         ),
       ),
     ];
+  }
+
+  Widget _buildInterfaceChip(String name) {
+    final isTunnel = _vpnInterfacePattern.hasMatch(name.toLowerCase());
+    if (Platform.isIOS) {
+      // Material Chip needs a Material ancestor, which CupertinoApp
+      // doesn't provide.
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: isTunnel
+              ? CupertinoColors.activeBlue.withValues(alpha: 0.2)
+              : CupertinoColors.systemGrey5,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Text(name, style: const TextStyle(fontSize: 12)),
+      );
+    }
+    return Chip(
+      label: Text(name, style: const TextStyle(fontSize: 12)),
+      backgroundColor: isTunnel ? Colors.blue.withValues(alpha: 0.2) : null,
+    );
   }
 
   Widget _sectionHeader(String title) {
